@@ -203,7 +203,7 @@ class CoreMLExportModel(torch.nn.Module):
         boxes = x[:, :4] * torch.tensor([1./w, 1./h, 1./w, 1./h])
         return class_probs, boxes
 
-def export_coreml(model, im, file, num_boxes, num_classes, labels, conf_thres, iou_thres, prefix=colorstr('CoreML:')):
+def export_coreml(model, im, file, num_boxes, num_classes, labels, conf_thres, iou_thres, int8, half, prefix=colorstr('CoreML:')):
     # YOLOv5 CoreML export
     try:
         check_requirements(('coremltools',))
@@ -314,6 +314,15 @@ def export_coreml(model, im, file, num_boxes, num_classes, labels, conf_thres, i
 
         ct_model = ct.models.MLModel(pipeline.spec)
         
+        bits, mode = (8, 'kmeans_lut') if int8 else (16, 'linear') if half else (32, None)
+        if bits < 32:
+            if platform.system() == 'Darwin':  # quantization only supported on macOS
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=DeprecationWarning)  # suppress numpy==1.20 float warning
+                    ct_model = ct.models.neural_network.quantization_utils.quantize_weights(ct_model, bits, mode)
+            else:
+                print(f'{prefix} quantization only supported on macOS, skipping...')
+
         f = str(file).replace('.pt', '.mlmodel')
         ct_model.save(f)
 
@@ -585,7 +594,8 @@ def run(
 
     # Load PyTorch model
     device = select_device(device)
-    assert not (device.type == 'cpu' and half), '--half only compatible with GPU export, i.e. use --device 0'
+    if half:
+        assert device.type != 'cpu' or coreml, '--half only compatible with GPU export, i.e. use --device 0'
     model = attempt_load(weights, map_location=device, inplace=True, fuse=True)  # load FP32 model
     nc, names = model.nc, model.names  # number of classes, class names
 
@@ -599,7 +609,7 @@ def run(
     im = torch.zeros(batch_size, 3, *imgsz).to(device)  # image size(1,3,320,192) BCHW iDetection
 
     # Update model
-    if half:
+    if half and not coreml:
         im, model = im.half(), model.half()  # to FP16
     model.train() if train else model.eval()  # training mode = no Detect() layer grid construction
     for k, m in model.named_modules():
@@ -626,7 +636,7 @@ def run(
         f[3] = export_openvino(model, im, file)
     if coreml:
         nb = shape[1]
-        _, f[4] = export_coreml(model, im, file, nb, nc, names, conf_thres, iou_thres)
+        _, f[4] = export_coreml(model, im, file, nb, nc, names, conf_thres, iou_thres, int8, half)
 
     # TensorFlow Exports
     if any((saved_model, pb, tflite, edgetpu, tfjs)):
